@@ -8,17 +8,14 @@ import pandas as pd
 import ta
 import requests
 
-# GitHub Secrets se API Keys fetch karna
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
-BASE_URL = "https://api.india.delta.exchange"  # Delta India Base URL
+BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "ETHUSDT"
-RISK_PERCENT = 0.02  # 2% Risk per trade
-RISK_REWARD_RATIO = 2.0  # 1:2 Risk to Reward (TP = 2x Risk)
+RISK_PERCENT = 0.02
 
 def generate_signature(secret, method, path, payload="", timestamp=""):
-    """Delta Exchange API Signature generator"""
     signature_data = method + timestamp + path + payload
     return hmac.new(
         secret.encode('utf-8'),
@@ -27,7 +24,6 @@ def generate_signature(secret, method, path, payload="", timestamp=""):
     ).hexdigest()
 
 def get_auth_headers(method, path, payload=""):
-    """Authenticated requests ke liye headers prepare karta hai"""
     timestamp = str(int(time.time()))
     signature = generate_signature(API_SECRET, method, path, payload, timestamp)
     return {
@@ -37,18 +33,14 @@ def get_auth_headers(method, path, payload=""):
         "Content-Type": "application/json"
     }
 
-def fetch_eth_candles():
-    """Delta Exchange se 15m candles fetch karta hai"""
+def fetch_candles(resolution, limit):
     try:
         url = f"{BASE_URL}/v2/history/candles"
-        params = {"resolution": "15m", "symbol": SYMBOL, "limit": 100}
+        params = {"resolution": resolution, "symbol": SYMBOL, "limit": limit}
         response = requests.get(url, params=params)
         data = response.json()
-        
         if not data.get("success") or not data.get("result"):
-            print(f"❌ Candle fetch failed: {data}")
             return None
-            
         candles = data["result"]
         df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
         df["close"] = df["close"].astype(float)
@@ -56,11 +48,10 @@ def fetch_eth_candles():
         df["low"] = df["low"].astype(float)
         return df
     except Exception as e:
-        print(f"❌ Exception in fetching candles: {e}")
+        print(f"❌ Exception fetching candles: {e}")
         return None
 
 def get_wallet_balance():
-    """Account balance (USDT) fetch karta hai"""
     try:
         path = "/v2/wallet/balances"
         headers = get_auth_headers("GET", path)
@@ -70,112 +61,148 @@ def get_wallet_balance():
             for balance in data.get("result", []):
                 if balance.get("asset_symbol") == "USDT":
                     return float(balance.get("available_balance", 0))
-        return 100.0  # Fallback balance test ke liye
-    except Exception as e:
-        print(f"⚠️ Balance fetch error, using default: {e}")
+        return 100.0
+    except Exception:
         return 100.0
 
-def calculate_lot_size(balance, entry_price, sl_price):
-    """Dynamic 2% Risk Lot Calculator"""
-    risk_amount = balance * RISK_PERCENT
-    price_risk = abs(entry_price - sl_price)
-    
-    if price_risk == 0:
-        return 1
-        
-    lot_qty = int(risk_amount / price_risk)
-    return max(1, lot_qty)  # Minimum 1 lot
+def get_open_positions():
+    """Check karta hai ki currently koi position open hai ya nahi"""
+    try:
+        path = "/v2/positions"
+        headers = get_auth_headers("GET", path)
+        res = requests.get(f"{BASE_URL}{path}", headers=headers)
+        data = res.json()
+        if data.get("success"):
+            for pos in data.get("result", []):
+                if pos.get("product_symbol") == SYMBOL and float(pos.get("size", 0)) != 0:
+                    return pos 
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching positions: {e}")
+        return None
 
-def place_bracket_order(side, price, sl_price, tp_price, qty):
-    """Delta Exchange par Bracket Order (Market Entry + SL + TP) place karta hai"""
+def close_position(side, size):
+    """Opposite crossover par purani position ko market order se cut/close karta hai"""
     path = "/v2/orders"
+    close_side = "sell" if side.lower() == "buy" else "buy"
     payload_dict = {
         "product_symbol": SYMBOL,
-        "size": qty,
-        "side": side.lower(),  # 'buy' or 'sell'
+        "size": abs(int(size)),
+        "side": close_side,
         "order_type": "market_order",
-        "stop_loss_price": str(round(sl_price, 2)),
-        "take_profit_price": str(round(tp_price, 2))
+        "reduce_only": True  
     }
-    
     payload_str = json.dumps(payload_dict)
     headers = get_auth_headers("POST", path, payload_str)
-    
     try:
         res = requests.post(f"{BASE_URL}{path}", data=payload_str, headers=headers)
         res_data = res.json()
         if res_data.get("success"):
-            print(f"✅ Order Placed Successfully! ID: {res_data['result']['id']}")
+            print(f"🔄 Existing position successfully closed via opposite crossover!")
+        else:
+            print(f"❌ Failed to close position: {res_data}")
+    except Exception as e:
+        print(f"❌ Error closing position: {e}")
+
+def calculate_lot_size(balance, entry_price, sl_price):
+    risk_amount = balance * RISK_PERCENT
+    price_risk = abs(entry_price - sl_price)
+    if price_risk == 0:
+        return 1
+    lot_qty = int(risk_amount / price_risk)
+    return max(1, lot_qty)
+
+def place_order(side, price, sl_price, qty):
+    path = "/v2/orders"
+    payload_dict = {
+        "product_symbol": SYMBOL,
+        "size": qty,
+        "side": side.lower(),
+        "order_type": "market_order",
+        "stop_loss_price": str(round(sl_price, 2))
+    }
+    payload_str = json.dumps(payload_dict)
+    headers = get_auth_headers("POST", path, payload_str)
+    try:
+        res = requests.post(f"{BASE_URL}{path}", data=payload_str, headers=headers)
+        res_data = res.json()
+        if res_data.get("success"):
+            print(f"✅ New {side.upper()} Order Placed! ID: {res_data['result']['id']}")
         else:
             print(f"❌ Order Placement Failed: {res_data}")
     except Exception as e:
         print(f"❌ Error placing order: {e}")
 
-def check_and_execute_trade():
+def run_bot_cycle():
     if not API_KEY or not API_SECRET:
         print("❌ Error: Delta API Keys missing!")
         sys.exit(1)
         
-    print("🚀 Running 9/21 EMA Crossover Strategy Check...")
+    print("🚀 Running 15m EMA Crossover Strategy with 4h SL Check...")
     
-    df = fetch_eth_candles()
-    if df is None or len(df) < 25:
+    df_15m = fetch_candles("15m", 100)
+    df_4h = fetch_candles("4h", 20)
+    
+    if df_15m is None or len(df_15m) < 25 or df_4h is None or len(df_4h) < 5:
         print("❌ Insufficient candle data.")
         return
 
-    # Calculate Indicators
-    df['ema_9'] = ta.trend.ema_indicator(df['close'], window=9)
-    df['ema_21'] = ta.trend.ema_indicator(df['close'], window=21)
+    df_15m['ema_9'] = ta.trend.ema_indicator(df_15m['close'], window=9)
+    df_15m['ema_21'] = ta.trend.ema_indicator(df_15m['close'], window=21)
     
-    # Recent Closed Candles
-    curr_close = df['close'].iloc[-2]
-    curr_ema_9 = df['ema_9'].iloc[-2]
-    curr_ema_21 = df['ema_21'].iloc[-2]
+    curr_close = df_15m['close'].iloc[-2]
+    curr_ema_9 = df_15m['ema_9'].iloc[-2]
+    curr_ema_21 = df_15m['ema_21'].iloc[-2]
     
-    prev_ema_9 = df['ema_9'].iloc[-3]
-    prev_ema_21 = df['ema_21'].iloc[-3]
+    prev_ema_9 = df_15m['ema_9'].iloc[-3]
+    prev_ema_21 = df_15m['ema_21'].iloc[-3]
     
-    # Recent Swing High/Low for Dynamic Stop Loss
-    swing_low = df['low'].iloc[-4:-1].min()
-    swing_high = df['high'].iloc[-4:-1].max()
+    prev_4h_low = df_4h['low'].iloc[-2]
+    prev_4h_high = df_4h['high'].iloc[-2]
 
-    print(f"📍 ETH Price: ${curr_close:.2f} | EMA 9: {curr_ema_9:.2f} | EMA 21: {curr_ema_21:.2f}")
+    print(f"📍 ETH Price: ${curr_close:.2f} | 15m EMA 9: {curr_ema_9:.2f} | EMA 21: {curr_ema_21:.2f}")
 
     signal = None
     sl_price = 0.0
-    tp_price = 0.0
 
-    # 1. Bullish Crossover (BUY Signal)
     if prev_ema_9 <= prev_ema_21 and curr_ema_9 > curr_ema_21:
         signal = "buy"
-        sl_price = swing_low  # SL recent Swing Low par
-        risk = curr_close - sl_price
-        tp_price = curr_close + (risk * RISK_REWARD_RATIO)  # 1:2 Risk-Reward TP
-
-    # 2. Bearish Crossover (SELL Signal)
+        sl_price = prev_4h_low
     elif prev_ema_9 >= prev_ema_21 and curr_ema_9 < curr_ema_21:
         signal = "sell"
-        sl_price = swing_high  # SL recent Swing High par
-        risk = sl_price - curr_close
-        tp_price = curr_close - (risk * RISK_REWARD_RATIO)  # 1:2 Risk-Reward TP
+        sl_price = prev_4h_high
 
-    # Signal Logic Execution
+    open_pos = get_open_positions()
+
     if signal:
-        balance = get_wallet_balance()
-        qty = calculate_lot_size(balance, curr_close, sl_price)
-        
-        print(f"🔥 Signal: {signal.upper()} | Entry: ${curr_close:.2f} | SL: ${sl_price:.2f} | TP: ${tp_price:.2f}")
-        print(f"🧮 Balance: ${balance:.2f} | Dynamic Qty: {qty} Lots (2% Risk)")
-        
-        place_bracket_order(signal, curr_close, sl_price, tp_price, qty)
+        if open_pos:
+            pos_size = float(open_pos.get("size", 0))
+            pos_side = "buy" if pos_size > 0 else "sell"
+            
+            if pos_side != signal:
+                print(f"🔄 Opposite crossover detected! Closing existing {pos_side.upper()} position...")
+                close_position(pos_side, pos_size)
+                time.sleep(2) 
+                
+                balance = get_wallet_balance()
+                qty = calculate_lot_size(balance, curr_close, sl_price)
+                print(f"🔥 Taking new {signal.upper()} trade | SL: ${sl_price:.2f} | Qty: {qty}")
+                place_order(signal, curr_close, sl_price, qty)
+            else:
+                print(f"ℹ️ Already in a {pos_side.upper()} position matching the trend. Holding.")
+        else:
+            balance = get_wallet_balance()
+            qty = calculate_lot_size(balance, curr_close, sl_price)
+            print(f"🔥 Fresh Signal: {signal.upper()} | Entry: ${curr_close:.2f} | 4h SL: ${sl_price:.2f}")
+            place_order(signal, curr_close, sl_price, qty)
     else:
-        print("⏳ No crossover signal found in this 15m cycle.")
+        print("⏳ No crossover signal found in this 15m cycle. Holding position (if any).")
 
     print("✅ Single-cycle execution finished cleanly.")
 
 if __name__ == "__main__":
     try:
-        check_and_execute_trade()
+        run_bot_cycle()
     except Exception as e:
         print(f"❌ Execution Exception: {e}")
         sys.exit(1)
