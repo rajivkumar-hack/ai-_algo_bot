@@ -1,4 +1,5 @@
 pandas
 ta
-delta-rest-client
 requests
+flask
+gunicorn
