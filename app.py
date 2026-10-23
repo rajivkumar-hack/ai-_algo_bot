@@ -7,6 +7,9 @@ import json
 import pandas as pd
 import ta
 import requests
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
 
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
@@ -66,7 +69,6 @@ def get_wallet_balance():
         return 100.0
 
 def get_open_positions():
-    """Check karta hai ki currently koi position open hai ya nahi"""
     try:
         path = "/v2/positions"
         headers = get_auth_headers("GET", path)
@@ -82,7 +84,6 @@ def get_open_positions():
         return None
 
 def close_position(side, size):
-    """Opposite crossover par purani position ko market order se cut/close karta hai"""
     path = "/v2/orders"
     close_side = "sell" if side.lower() == "buy" else "buy"
     payload_dict = {
@@ -98,7 +99,7 @@ def close_position(side, size):
         res = requests.post(f"{BASE_URL}{path}", data=payload_str, headers=headers)
         res_data = res.json()
         if res_data.get("success"):
-            print(f"🔄 Existing position successfully closed via opposite crossover!")
+            print("🔄 Existing position successfully closed via opposite crossover!")
         else:
             print(f"❌ Failed to close position: {res_data}")
     except Exception as e:
@@ -133,19 +134,22 @@ def place_order(side, price, sl_price, qty):
     except Exception as e:
         print(f"❌ Error placing order: {e}")
 
-def run_bot_cycle():
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot is running live!"
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
     if not API_KEY or not API_SECRET:
-        print("❌ Error: Delta API Keys missing!")
-        sys.exit(1)
+        return jsonify({"status": "error", "message": "API keys missing"}), 500
         
-    print("🚀 Running 15m EMA Crossover Strategy with 4h SL Check...")
+    print("🔔 Webhook received from TradingView! Running strategy check...")
     
     df_15m = fetch_candles("15m", 100)
     df_4h = fetch_candles("4h", 20)
     
     if df_15m is None or len(df_15m) < 25 or df_4h is None or len(df_4h) < 5:
-        print("❌ Insufficient candle data.")
-        return
+        return jsonify({"status": "error", "message": "Insufficient candle data"}), 400
 
     df_15m['ema_9'] = ta.trend.ema_indicator(df_15m['close'], window=9)
     df_15m['ema_21'] = ta.trend.ema_indicator(df_15m['close'], window=21)
@@ -159,8 +163,6 @@ def run_bot_cycle():
     
     prev_4h_low = df_4h['low'].iloc[-2]
     prev_4h_high = df_4h['high'].iloc[-2]
-
-    print(f"📍 ETH Price: ${curr_close:.2f} | 15m EMA 9: {curr_ema_9:.2f} | EMA 21: {curr_ema_21:.2f}")
 
     signal = None
     sl_price = 0.0
@@ -180,29 +182,17 @@ def run_bot_cycle():
             pos_side = "buy" if pos_size > 0 else "sell"
             
             if pos_side != signal:
-                print(f"🔄 Opposite crossover detected! Closing existing {pos_side.upper()} position...")
                 close_position(pos_side, pos_size)
                 time.sleep(2) 
-                
                 balance = get_wallet_balance()
                 qty = calculate_lot_size(balance, curr_close, sl_price)
-                print(f"🔥 Taking new {signal.upper()} trade | SL: ${sl_price:.2f} | Qty: {qty}")
                 place_order(signal, curr_close, sl_price, qty)
-            else:
-                print(f"ℹ️ Already in a {pos_side.upper()} position matching the trend. Holding.")
         else:
             balance = get_wallet_balance()
             qty = calculate_lot_size(balance, curr_close, sl_price)
-            print(f"🔥 Fresh Signal: {signal.upper()} | Entry: ${curr_close:.2f} | 4h SL: ${sl_price:.2f}")
             place_order(signal, curr_close, sl_price, qty)
-    else:
-        print("⏳ No crossover signal found in this 15m cycle. Holding position (if any).")
 
-    print("✅ Single-cycle execution finished cleanly.")
+    return jsonify({"status": "success", "signal": signal}), 200
 
 if __name__ == "__main__":
-    try:
-        run_bot_cycle()
-    except Exception as e:
-        print(f"❌ Execution Exception: {e}")
-        sys.exit(1)
+    app.run(host="0.0.0.0", port=10000)
